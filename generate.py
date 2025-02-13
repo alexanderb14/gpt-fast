@@ -26,7 +26,7 @@ def device_sync(device):
 torch._inductor.config.coordinate_descent_tuning = True
 torch._inductor.config.triton.unique_kernel_names = True
 # Experimental features to reduce compilation times, will be on by default in future
-torch._inductor.config.fx_graph_cache = True 
+torch._inductor.config.fx_graph_cache = True
 torch._functorch.config.enable_autograd_cache = True
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -191,10 +191,19 @@ def generate(
     seq = empty
     input_pos = torch.arange(0, T, device=device)
 
+
+    print("Prefilling with shapes: prompt=", prompt.shape, "seq=", seq.shape, "input_pos=", input_pos.shape)
+    t0 = time.time()
     next_token = prefill(model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs).clone()
+    torch.cuda.synchronize()
+    prefill_time = time.time() - t0
+    print("Prefill time:", prefill_time)
+
     if is_speculative:
         prefill(draft_model, prompt.view(batch_size, -1), input_pos, **sampling_kwargs)
     seq[:, T] = next_token.squeeze()
+
+    t0 = time.time()
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
@@ -218,6 +227,9 @@ def generate(
     else:
         generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
         seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
+
+    gen_time = time.time() - t0
+    print("Gen time:", gen_time)
 
     generate_stats = {
         'accept_counts': accept_counts
@@ -294,6 +306,7 @@ def main(
     checkpoint_path: Path = Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"),
     compile: bool = True,
     compile_prefill: bool = False,
+    compile_prefill_reduce_overhead: bool = False,
     profile: Optional[Path] = None,
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
@@ -357,6 +370,9 @@ def main(
         # Uncomment to squeeze more perf out of prefill
         if compile_prefill:
             prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
+
+        if compile_prefill_reduce_overhead:
+            prefill = torch.compile(prefill, fullgraph=True, dynamic=True, mode="reduce-overhead")
 
 
     aggregate_metrics = {
@@ -471,6 +487,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
+    parser.add_argument('--compile_prefill_reduce_overhead', action='store_true', help='Whether to compile the prefill with reduce-overhead (improves prefill perf, but higher compile times)')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
     parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
@@ -479,6 +496,6 @@ if __name__ == '__main__':
     args = parser.parse_args()
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
-        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
+        args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.compile_prefill_reduce_overhead, args.profile, args.draft_checkpoint_path,
         args.speculate_k, args.device
     )
